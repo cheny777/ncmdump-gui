@@ -61,12 +61,47 @@ pre {
     color: #f9fafb;
     border-radius: 10px;
     padding: 16px;
-    min-height: 180px;
-    overflow: auto;
+    height: 360px;
+    overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-word;
+    font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
 }
 
 small {
     color: #6b7280;
+}
+
+.progress-box {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+progress {
+    width: 100%;
+    appearance: none;
+    height: 16px;
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+progress::-webkit-progress-bar {
+    background-color: #e5e7eb;
+}
+
+progress::-webkit-progress-value {
+    background-color: #2563eb;
+}
+
+progress::-moz-progress-bar {
+    background-color: #2563eb;
+}
+
+#batchProgressText {
+    min-width: 48px;
+    text-align: right;
+    color: #111827;
+    font-weight: 600;
 }

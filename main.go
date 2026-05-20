@@ -7,12 +7,16 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sqweek/dialog"
 )
@@ -104,44 +108,114 @@ func convertFolderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	concurrency := parseConcurrency(r.FormValue("concurrency"))
 	files := r.MultipartForm.File["files"]
 	if len(files) == 0 {
 		http.Error(w, "请先选择文件夹并包含 .ncm 文件。", http.StatusBadRequest)
 		return
 	}
 
-	var builder strings.Builder
-	count := 0
+	var candidates []*multipart.FileHeader
 	for _, header := range files {
-		if !strings.HasSuffix(strings.ToLower(header.Filename), ".ncm") {
-			continue
-		}
-		count++
-		file, err := header.Open()
-		if err != nil {
-			builder.WriteString(fmt.Sprintf("打开 %s 失败：%v\n", header.Filename, err))
-			continue
-		}
-		tempPath, cleanup, err := saveUploadedFile(file, header.Filename)
-		file.Close()
-		if err != nil {
-			builder.WriteString(fmt.Sprintf("保存 %s 失败：%v\n", header.Filename, err))
-			continue
-		}
-		builder.WriteString(fmt.Sprintf("转换 %s ...\n", header.Filename))
-		logText, err := convertOnce(tempPath, target)
-		cleanup()
-		builder.WriteString(logText)
-		if err != nil {
-			builder.WriteString(fmt.Sprintf("转换 %s 失败：%v\n", header.Filename, err))
+		if strings.HasSuffix(strings.ToLower(header.Filename), ".ncm") {
+			candidates = append(candidates, header)
 		}
 	}
-	if count == 0 {
+	if len(candidates) == 0 {
 		http.Error(w, "未找到任何 .ncm 文件。", http.StatusBadRequest)
 		return
 	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte(builder.String()))
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "服务器不支持实时日志输出。", http.StatusInternalServerError)
+		return
+	}
+
+	type batchResult struct {
+		fileName string
+		log      string
+		err      error
+	}
+
+	results := make(chan batchResult, len(candidates))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+
+	fmt.Fprintf(w, "开始批量转换，共 %d 个 .ncm 文件，最大并发 %d。\n", len(candidates), concurrency)
+	flusher.Flush()
+
+	for _, header := range candidates {
+		wg.Add(1)
+		head := header
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			result := batchResult{fileName: head.Filename}
+			result.log = fmt.Sprintf("--- %s 开始转换 ---\n", head.Filename)
+
+			file, err := head.Open()
+			if err != nil {
+				result.err = fmt.Errorf("打开文件失败：%w", err)
+				result.log += fmt.Sprintf("%s\n", result.err)
+				results <- result
+				return
+			}
+			defer file.Close()
+
+			tempPath, cleanup, err := saveUploadedFile(file, head.Filename)
+			if err != nil {
+				result.err = fmt.Errorf("保存临时文件失败：%w", err)
+				result.log += fmt.Sprintf("%s\n", result.err)
+				results <- result
+				return
+			}
+			defer cleanup()
+
+			logText, err := convertOnce(tempPath, target)
+			result.log += logText
+			if err != nil {
+				result.err = fmt.Errorf("转换失败：%w", err)
+			}
+			results <- result
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var processed int32
+	failed := 0
+	for res := range results {
+		count := atomic.AddInt32(&processed, 1)
+		fmt.Fprintf(w, "已完成 %d/%d：%s\n", count, len(candidates), res.fileName)
+		fmt.Fprint(w, res.log)
+		if res.err != nil {
+			failed++
+			fmt.Fprintf(w, "%s 处理失败：%v\n", res.fileName, res.err)
+		}
+		flusher.Flush()
+	}
+
+	fmt.Fprintf(w, "批量转换完成：%d 个文件，成功 %d，失败 %d。\n", len(candidates), len(candidates)-failed, failed)
+	flusher.Flush()
+}
+
+func parseConcurrency(value string) int {
+	const defaultConcurrency = 10
+	if value == "" {
+		return defaultConcurrency
+	}
+	c, err := strconv.Atoi(value)
+	if err != nil || c < 1 {
+		return defaultConcurrency
+	}
+	return c
 }
 
 func chooseTargetHandler(w http.ResponseWriter, r *http.Request) {
